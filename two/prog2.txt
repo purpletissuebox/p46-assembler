@@ -1,0 +1,2 @@
+ADDI T2, T2, 2
+INCLUDE "../prog3.txt"
