@@ -5,12 +5,7 @@ import argparse
 import ast
 import copy
 import pickle
-from collections import namedtuple as struct
 import lark
-
-P46WHITESPACE = ["\t","\v","\f","\r"," "]
-P46OPERATORS = ["(",")","[","]","+","-","*","/","%","&","|","^","~",",","!","=","<",">",":"]
-P46ALLOWEDSYMBOLS = ["$","{","}","\\","'","?","`"]
 
 P46GRAMMAR = """head: statement*
 
@@ -22,12 +17,15 @@ label: IDENTIFIER ":"  -> internal_label
 instruction: KEYWORD arglist
 arglist: (expression ("," expression)*)?
 
-?expression: comparison (LOGIC_OP expression)*
-?comparison: bitstring (COMP_OP expression)*
-?bitstring: addition (BIT_OP expression)*
-?addition: multiplication (ADD_OP expression)*
-?multiplication: negation (MUL_OP expression)*
-?negation: UNARY_OP* atom
+?expression: binary_expr | unary_expr
+
+?binary_expr: comparison (LOGIC_OP expression)?
+?comparison: bitstring (COMP_OP expression)?
+?bitstring: addition (BIT_OP expression)?
+?addition: multiplication (ADD_OP expression)?
+?multiplication: atom (MUL_OP expression)?
+?unary_expr: UNARY_OP expression
+
 ?atom: NUMBER -> integer
      | STRING -> string
      | IDENTIFIER -> symbol
@@ -73,17 +71,16 @@ def checkArgs():
 
 def createParser(cpu):
 	myGrammar = P46GRAMMAR + "REGISTER.1: "
-	for regname in cpu.registers:
-		myGrammar += "\"" + regname + "\" | "
-	myGrammar += "\"$r\" DIGIT DIGIT*\nKEYWORD.1: "
-	for keyw in (cpu.mnemonics + cpu.pseudo_ops + cpu.directives):
-		if keyw:
-			myGrammar += "\"" + keyw + "\" | "
-	myGrammar += "\"NOP\""
-		
+	for regname in cpu["registers"]:
+		myGrammar += "\"" + regname + "\"i | "
+	myGrammar += "\"$r\" NUMBER*\nKEYWORD.1: "
+	for keyw in cpu["keywords"]:
+		myGrammar += "\"" + keyw + "\"i | "
+	myGrammar = myGrammar[0:-3]
+	
 	return lark.Lark(grammar = myGrammar, start = "head", propagate_positions = True, parser = "lalr", lexer = "contextual")
 
-def parseFile(infile, ctxt):
+def parseFile(infile, ctxt, caps):
 	cwd = os.getcwd()
 	infile = os.path.abspath(infile)
 	os.chdir(os.path.dirname(infile))
@@ -98,8 +95,8 @@ def parseFile(infile, ctxt):
 	except lark.exceptions.UnexpectedInput as e:
 		raise P46Error("Syntax error.\n" + e.get_context(text)[0:-1], infile, e.line, e.column)
 	
-	validateASM(tree, infile)
-	pass0(tree, infile, ctxt)	
+	caps.visit(tree)
+	pass0(tree, infile, ctxt, caps)	
 	os.chdir(cwd)
 
 def getContents(path):
@@ -111,37 +108,29 @@ def getContents(path):
 		infile.close()
 		return text
 
-def validateASM(tree, file):
-	for stmt in tree.children:
-		if len(stmt.children) > 0:
-			if stmt.children[-1].data == "instruction":
-				validateInstruction(stmt.children[-1], file)
-
-def validateInstruction(inst, file):
+def verifyInstruction(inst, file):
 	keyw = inst.children[0]
 	args = inst.children[1].children
 	
-	fmt = fmtCodes[fmts[keyw]]
+	fmt = P46["formats"][P46["keywords"][keyw.value]]
 	
 	i = 0
 	while i < len(fmt):
-		if fmt[i] == "any":
-			i += 1
-			continue
-		elif fmt[i] == "array":
+		if i >= len(args):
+			raise P46Error(keyw + " keyword requires " + str(len(fmt)) + " arguments, but only " + str(len(args)) + " were given.", file, keyw.line, keyw.column)
+		
+		if fmt[i] == "array":
 			i = -1
 			break
-		else:
-			if i >= len(args):
-				raise P46Error(keyw + " keyword requires " + str(len(fmt)) + " arguments, but only " + str(len(args)) + " were given.", file, keyw.line, keyw.column)
+		elif fmt[i] != "any":
 			if fmt[i] != args[i].data:
-				raise P46Error("Argument #" + str(i+1) + " of " + keyw + " must be of type " + fmt[i] + ", but \"" + args[i].data + "\" was given.", file, args[i].line, args[i].column)
+				raise P46Error("Argument #" + str(i+1) + " of \"" + keyw + "\" must be of type \"" + fmt[i] + "\", but \"" + args[i].data + "\" was given.", file, args[i].meta.line, args[i].meta.column)
 		i += 1
 	
 	if (len(fmt) != len(args)) and i >= 0:
 		raise P46Error(keyw + " keyword uses " + str(len(fmt)) + " arguments, but " + str(len(args)) + " were given.", file, args[i].meta.line, args[i].meta.column)
 
-def pass0(tree, filename, ctxt):
+def pass0(tree, filename, ctxt, caps):
 	stmt = None
 	inst = None
 	lbls = None
@@ -174,10 +163,11 @@ def pass0(tree, filename, ctxt):
 					
 		if keyw == "INCLUDE":
 			try:
-				parseFile(getStringFromString(args[0].children[0]), ctxt)
+				parseFile(getStringFromString(args[0].children[0]), ctxt, caps)
 			except P46Error as e:
 				raise P46Error("", filename, inst.meta.line, inst.meta.column, e)
-				
+		
+		verifyInstruction(inst, filename)
 		ctxt.instructions.append(stmt)
 	
 	ctxt.instructions.append(lark.Tree("statement", [lark.Tree("instruction", ["FILE", lark.Tree("", [0])])]))
@@ -203,24 +193,20 @@ def pass1(filename0, ctxt):
 		
 		match(keyw):
 			case "INVOKE":
-				insertMacro(ctxt, i, args, visitorMac)
+				insertMacro(ctxt, i, args, visitorMac, fileStack[-1])
 				continue
 			case "REPEAT":
-				insertRept(ctxt, i, args)
+				insertRept(ctxt, i, args, PC, fileStack[-1])
 				continue
 			case "ENDR":
-				raise P46Error("ENDR encountered outside of a REPEAT block.", fileStack[-1], keyw.line, keyw.column)
+				raise P46Error("\"ENDR\" encountered outside of a REPEAT block.", fileStack[-1], keyw.line, keyw.column)
 			case "IF":
-				insertIf(ctxt, i, args)
+				insertIf(ctxt, i, args, PC, fileStack[-1])
 				continue
-			case "ELIF":
-				raise P46Error("ELIF encountered outside of an IF block.", fileStack[-1], keyw.line, keyw.column)
-			case "ELSE":
-				raise P46Error("ELSE encountered outside of an IF block.", fileStack[-1], keyw.line, keyw.column)
-			case "ENDC":
-				raise P46Error("ENDC encountered outside of an IF block.", fileStack[-1], keyw.line, keyw.column)
+			case "ELIF" | "ELSE" | "ENDC":
+				raise P46Error("\"" + keyw + "\" encountered outside of an IF block.", fileStack[-1], keyw.line, keyw.column)
 			case "SET":
-				setSymbol(ctxt, i, args)
+				setSymbol(ctxt, i, args, fileStack[-1])
 			case "FILE":
 				if inst.children[1].children[0] == 0:
 					fileStack.pop()
@@ -241,43 +227,49 @@ def pass1(filename0, ctxt):
 				PC += len(args) << 2
 			case _:
 				if PC & 3:
-					raise P46Error("Instruction not aligned to a word boundary.", filestack[-1], keyw.line, keyw.column)
+					raise P46Error("Instruction not aligned to a word boundary.", fileStack[-1], keyw.line, keyw.column)
 				PC += 4
 		
 		i += 1
 	
 	trackQualifiedNames(lastSeenLabel, ctxt.labelBuf, ctxt, PC, fileStack[0], rel)
 
-def setSymbol(ctxt, idx, args):
+def setSymbol(ctxt, idx, args, file):
 	sym = args[0].children[0]
-	value = evaluateExpr(args[1], ctxt, None)
+	value = evaluateExpr(args[1], ctxt, None, False, file)
+	ctxt.sets[sym] = value
 	ctxt.symbols[sym] = value
 
-def getNumber(tree, ctxt, PC):
+def getNumber(tree, ctxt, PC, demand, file):
 	token = tree.children[0]
 	match tree.data:
 		case "integer":
 			return Symbol(int(token.value, 0), False)
 		case "symbol":
 			if token.value in ctxt.symbols:
-				return ctxt.symbols[token.value]
-			raise P46Error("Symbol \"" + token.value + "\" was referenced before being given a value.", file, token.line, token.column)
+				result = ctxt.symbols[token.value]
+				if result.value != None:
+					return result
+			if demand:
+				raise P46Error("Symbol \"" + token.value + "\" was referenced before being given a value.", file, token.line, token.column)
+			return Symbol(None, True)
 		case "program_counter":
 			return Symbol(PC, True)
 		case _:
-			return evaluateExpr(tree, ctxt, PC)
+			return evaluateExpr(tree, ctxt, PC, demand, file)
 
-def evaluateExpr(expr, ctxt, PC):
-	if len(expr.children) == 3:
-		lhs = getNumber(expr.children[0], ctxt, PC)
-		op = expr.children[1]
-		rhs = getNumber(expr.children[2], ctxt, PC)
-	elif len(expr.children) == 2:
+def evaluateExpr(expr, ctxt, PC, demand, file):
+	if len(expr.children) == 1:
+		return getNumber(expr, ctxt, PC, demand, file)
+	
+	if expr.data == "unary_expr":
 		lhs = Symbol(0, False)
 		op = expr.children[0]
-		rhs = getNumber(expr.children[1], ctxt, PC)
-	elif len(expr.children) == 1:
-		return getNumber(expr.children[0], ctxt, PC)
+		rhs = getNumber(expr.children[1], ctxt, PC, demand, file)
+	else:
+		lhs = getNumber(expr.children[0], ctxt, PC, demand, file)
+		op = expr.children[1]
+		rhs = getNumber(expr.children[2], ctxt, PC, demand, file)
 	
 	match op:
 		case "+":
@@ -317,25 +309,27 @@ def evaluateExpr(expr, ctxt, PC):
 		case "^^":
 			return Symbol(((lhs.value != 0) + (rhs.value != 0) == 1), lhs.isRelative or rhs.isRelative)
 
-def insertMacro(ctxt, idx, args, visitor):
+def insertMacro(ctxt, idx, args, visitor, file):
 	visitor.initialize(args)
 	macroContents = copy.deepcopy(ctxt.macros[args[0].children[0]])
 	for line in macroContents:
 		visitor.visit(line)
+		verifyInstruction(separateInstruction(line)[1], file)
 	
-	if visitor.usedAll():
-		raise P46Error("Macro \"" + args[0] + "\" demands " + str(len(args)-1) + " arguments, but did not consume #" + str(visitor.usedAll()) + ".", file, args[-1].line, args[-1].column)
+	idx = visitor.usedAll()
+	if idx:
+		raise P46Error("Macro \"" + args[0].children[0] + "\" demands " + str(len(args)-1) + " arguments, but did not consume #" + str(idx) + ".", file, args[idx].meta.line, args[idx].meta.column)
 	
 	ctxt.instructions[idx:idx+1] = macroContents
 
-def insertRept(ctxt, base, args):
+def insertRept(ctxt, base, args, PC, file):
 	contents = []
 	nestDepth = 1
 	i = 1
-	N = evaluateExpr(args[0])
+	N = evaluateExpr(args[0], ctxt, PC, True, file).value
 	
 	while (base+i) < len(ctxt.instructions):
-		x = separateInstruction(ctxt.instrucitons[base + i])[1].children[0]
+		x = separateInstruction(ctxt.instructions[base + i])[1].children[0]
 		if x == "REPEAT":
 			nestDepth += 1
 		if x == "ENDR":
@@ -347,35 +341,33 @@ def insertRept(ctxt, base, args):
 		i += 1
 		
 	if (base+i) == len(ctxt.instructions):
-		raise P64Error("REPEAT block was never terminated.", file, args[0].line, args[0].column)
+		raise P46Error("REPEAT block was never terminated.", file, args[0].meta.line, args[0].meta.column)
 	
 	ctxt.instructions[base:base+i+1] = contents*N
 
-def insertIf(ctxt, base, args):
+def insertIf(ctxt, base, args, PC, file):
 	contents = []
 	nestDepth = 1
 	i = 1
-	conditionMet = evaluateExpr(args[0])
+	
+	conditionMet = evaluateExpr(args[0], ctxt, PC, True, file).value
 	
 	while (not conditionMet and ((base+i) < len(ctxt.instructions))):
-		inst = separateInstruction(ctxt.instrucitons[base + i])[1]
+		inst = separateInstruction(ctxt.instructions[base + i])[1]
 		x = inst.children[0]
-		y = inst.children[1]
 		
 		if x == "IF":
 			nestDepth += 1
-		if x == "ENDC":
+		elif x == "ENDC":
 			nestDepth -= 1
 			if nestDepth == 0:
 				break
 		
 		if nestDepth == 1:
 			if x == "ELIF":
-				conditionMet = evaluateExpr(y)
+				conditionMet = evaluateExpr(inst.children[1].children[0], ctxt, PC, True, file).value
 			if x == "ELSE":
 				conditionMet = True
-			if x == "ENDC":
-				break
 
 		i += 1
 	
@@ -385,7 +377,7 @@ def insertIf(ctxt, base, args):
 	nestDepth = 1
 	
 	while (base+i) < len(ctxt.instructions):
-		x = separateInstruction(ctxt.instrucitons[base + i])[1].children[0]
+		x = separateInstruction(ctxt.instructions[base + i])[1].children[0]
 		
 		if x == "IF":
 			nestDepth += 1
@@ -398,7 +390,7 @@ def insertIf(ctxt, base, args):
 		i += 1
 	
 	if (base+i) == len(ctxt.instructions):
-		raise P64Error("IF block was never terminated.", file, args[0].line, args[0].column)
+		raise P46Error("IF block was never terminated.", file, args[0].meta.line, args[0].meta.column)
 	
 	ctxt.instructions[base:base+i+1] = contents
 
@@ -445,21 +437,23 @@ def separateInstruction(statement):
 def readMacro(statements, base, name, file, ctxt):
 	contents = []
 	i = 1
+	breakpoint()
 	if name in ctxt.macros:
-		raise P64Error("Macro \"" + name + "\" previously defined.", file, statements[base].meta.line, statements[base].meta.column)
+		raise P46Error("Macro \"" + name + "\" previously defined.", file, statements[base].meta.line, statements[base].meta.column)
 	
 	while (base + i) < len(statements):
 		x = separateInstruction(statements[base + i])[1].children[0]
+		
 		if x == "MACRO":
-			raise P64Error("Macro \"" + name + "\" was never terminated.", file, statements[base].meta.line, statements[base].meta.column)
-		if x != "ENDM":
-			contents.append(statements[base + i])
+			raise P46Error("Macro \"" + name + "\" was never terminated.", file, statements[base].meta.line, statements[base].meta.column)
 		if x == "ENDM":
 			break
+		
+		contents.append(statements[base + i])
 		i += 1
 	
 	if (base+i) == len(statements):
-		raise P64Error("Macro \"" + name + "\" was never terminated.", file, statements[base].meta.line, statements[base].meta.column)
+		raise P46Error("Macro \"" + name + "\" was never terminated.", file, statements[base].meta.line, statements[base].meta.column)
 	
 	ctxt.macros[name] = contents
 	return i
@@ -486,7 +480,7 @@ def main():
 	myParser = createParser(P46)
 	myCtxt = ASMContext(arglist.warnings_as_errors, myParser)
 	try:
-		parseFile(arglist.infile, myCtxt)
+		parseFile(arglist.infile, myCtxt, Capitalizer())
 		pass1(arglist.infile, myCtxt)
 	except P46Error as e:
 		printErrors(e)
@@ -496,56 +490,36 @@ def main():
 	
 ###############################
 
-CPU = struct("CPU", ["registers", "mnemonics", "pseudo_ops", "directives"])
-
-#N = <none>
-#S = reg
-#D = reg, reg
-#R = reg, reg, reg
-#J = imm
-#L = reg, imm
-#I = reg, reg, imm
-#M = reg, mem
-#F = string
-#A = array
-#Y = symbol
-#V = symbol, array
-#T = symbol, imm
-
-
-
-#reg = register
-#imm = integer | symbol | PC | expr
-fmts = dict([
-	("ADD","R"), ("SUB","R"), ("AND","R"), ("OR","R"), ("XOR","R"), ("SLL","R"), ("SRL","R"), ("SRA","R"), ("SLT","R"), ("SLTU","R"), ("ADDI","I"), ("RSUBI","I"), ("ANDI","I"), ("ORI","I"), ("XORI","I"), ("SLLI","I"), ("SRLI","I"), ("SRAI","I"), ("SLTI","I"), ("SLTIU","I"), ("BEQ","I"), ("BNE","I"), ("BLT","I"), ("BLTU","I"), ("BGE","I"), ("BGEU","I"), ("J","J"), ("JAL","J"), ("JRALR","D"), ("LUI","L"), ("PCOFF","L"), ("MFHI","S"), ("MFLO","S"), ("LB","M"), ("LBU","M"), ("LH","M"), ("LHU","M"), ("LW","M"), ("SB","M"), ("SH","M"), ("SW","M"), ("MUL","D"), ("MULU","D"), ("DIV","D"), ("DIVU","D"), ("MULI","D"), ("MULIU","D"), ("DIVI","D"), ("DIVIU","D"),
+P46 = dict([
+	("registers",
+		["R0","AT","V0","V1","A0","A1","A2","A3","T0","T1","T2","T3","T4","T5","T6","T7","S0","S1","S2","S3","S4","S5","S6","S7","K0","K1","K2","K3","P0","P1","SP","RA"]),
 	
-	("NOP","N"), ("MOV","D"), ("LDR","L"), ("INC","S"), ("DEC","S"),
+	("keywords",
+	dict([
+		("ADD","R"), ("SUB","R"), ("AND","R"), ("OR","R"), ("XOR","R"), ("SLL","R"), ("SRL","R"), ("SRA","R"), ("SLT","R"), ("SLTU","R"), ("ADDI","I"), ("RSUBI","I"), ("ANDI","I"), ("ORI","I"), ("XORI","I"), ("SLLI","I"), ("SRLI","I"), ("SRAI","I"), ("SLTI","I"), ("SLTIU","I"), ("BEQ","I"), ("BNE","I"), ("BLT","I"), ("BLTU","I"), ("BGE","I"), ("BGEU","I"), ("J","J"), ("JAL","J"), ("JRALR","D"), ("LUI","L"), ("PCOFF","L"), ("MFHI","S"), ("MFLO","S"), ("LB","M"), ("LBU","M"), ("LH","M"), ("LHU","M"), ("LW","M"), ("SB","M"), ("SH","M"), ("SW","M"), ("MUL","D"), ("MULU","D"), ("DIV","D"), ("DIVU","D"), ("MULI","D"), ("MULIU","D"), ("DIVI","D"), ("DIVIU","D"),
 	
-	("INCLUDE","F"), ("INVOKE","V"), ("MACRO","Y"), ("ENDM","N"), ("REPEAT","J"), ("ENDR","N"), ("IF","J"), ("ELIF","J"), ("ELSE","N"), ("ENDC","N"), ("RESERVE","J"), ("DATAB","A"), ("DATAH","A"), ("DATAW","A"), ("ORG","J"), ("SET","T"), ("PRINT","F")
-])
-fmtCodes = dict([
-	("N", []),
-	("S", ["register"]),
-	("D", ["register","register"]),
-	("R", ["register","register","register"]),
-	("J", ["any"]),
-	("L", ["register","any"]),
-	("I", ["register","register","any"]),
-	("M", ["register","memory_access"]),
-	("F", ["string"]),
-	("A", ["array"]),
-	("Y", ["symbol"]),
-	("V", ["symbol", "array"]),
-	("T", ["symbol", "any"])
-])
-
-
-P46 = CPU(
-	["R0","AT","V0","V1","A0","A1","A2","A3","T0","T1","T2","T3","T4","T5","T6","T7","S0","S1","S2","S3","S4","S5","S6","S7","K0","K1","K2","K3","P0","P1","SP","RA"],
-	["ADD","SUB",None,None,   "AND","OR","XOR",None,   "SLL",None,"SRL","SRA",   "SLT","SLTU",None,None,   "ADDI","RSUBI",None,None,   "ANDI","ORI","XORI",None,   "SLLI",None,"SRLI","SRAI",   "SLTI","SLTUI",None,None,   "BEQ","BNE","BLT","BLTU","BGE","BGEU",None,None,   "J","JAL","JRALR",None,"LUI","PCOFF","MFHI","MFLO",   "LB","LBU","LH","LHU","LW","SB","SH","SW",   "MUL","MULU","DIV","DIVU","MULI","MULIU","DIVI","DIVIU"],
-	["NOP","MOV","LDR","INC","DEC","NEG","NOT","SGT","SLE","ABS","ROL","ROLI","MULT","MULTI","DIVV","DIVVI","MOD","JR","JRAL","B","BGT","BLE","BEQZ","BNEZ","BLTZ","BGEZ","BGTZ","BLEZ","IN","OUT"],
-	["INCLUDE","INVOKE","MACRO","ENDM","REPEAT","ENDR","IF","ELIF","ELSE","ENDC","RESERVE","DATAB","DATAH","DATAW","ORG","SET", "PRINT"]
-	)
+		("NOP","N"), ("MOV","D"), ("LDR","L"), ("INC","S"), ("DEC","S"), ("NEG","S"), ("NOT","S"), ("SGT","R"), ("SLE","R"), ("ABS","D"), ("ROL","R"), ("ROLI","I"), ("MULT","R"), ("MULTI","I"), ("DIVV","R"), ("DIVVI","I"), ("MOD","R"), ("JR","S"), ("JRAL","S"), ("B","J"), ("BGT","I"), ("BLE","I"), ("BEQZ","L"), ("BNEZ","L"), ("BLTZ","L"), ("BGEZ","L"), ("BGTZ","L"), ("BLEZ","L"), ("IN","L"), ("OUT","L"),
+	
+		("INCLUDE","F"), ("INVOKE","V"), ("MACRO","Y"), ("ENDM","N"), ("REPEAT","J"), ("ENDR","N"), ("IF","J"), ("ELIF","J"), ("ELSE","N"), ("ENDC","N"), ("RESERVE","J"), ("DATAB","A"), ("DATAH","A"), ("DATAW","A"), ("ORG","J"), ("SET","T"), ("PRINT","F")
+	])),
+	
+	("formats",
+	dict([
+		("N", []),
+		("S", ["register"]),
+		("D", ["register","register"]),
+		("R", ["register","register","register"]),
+		("J", ["any"]),
+		("L", ["register","any"]),
+		("I", ["register","register","any"]),
+		("M", ["register","memory_access"]),
+		("F", ["string"]),
+		("A", ["array"]),
+		("Y", ["symbol"]),
+		("V", ["symbol", "array"]),
+		("T", ["symbol", "any"])
+	]))
+	])
 
 ###############################
 
@@ -564,6 +538,7 @@ class ASMContext:
 		self.parser = parser
 		self.exports = dict()
 		self.symbols = dict()
+		self.sets = dict()
 		self.labelBuf = []
 		self.w = warnings
 
@@ -588,7 +563,7 @@ class SymbolReplacer(lark.visitors.Visitor_Recursive):
 			else:
 				periodScan = True
 		
-		x.children[0].value = ".".join(sym)
+		x.children[0] = x.children[0].update(value = ".".join(sym))
 
 class MacroReplacer(lark.visitors.Visitor_Recursive):
 	def __init__(self):
@@ -618,6 +593,10 @@ class MacroReplacer(lark.visitors.Visitor_Recursive):
 				return i
 			i += 1
 		return 0
+
+class Capitalizer(lark.visitors.Visitor_Recursive):	
+	def instruction(self, x):
+		x.children[0] = x.children[0].update(value = x.children[0].value.upper())
 
 class Symbol:
 	def __init__(self, value, rel):

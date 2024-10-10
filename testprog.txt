@@ -1,22 +1,40 @@
 myRoutine::
 
-START: ADDI T0, R0, 0x400
+START: addi T0, T1, t2
 .loop: DEC T0
 BEQ R0, T0, ..loop
+
+SET Q, START
+
+IF Q == 1
+DATAW Q
+	IF Q == 100
+	NOP
+	ENDC
+ELIF Q == 2
+DATAH Q, Q
+ELSE
+DATAB Q, Q, Q, Q
+ENDC
+
+REPEAT Q
+DATAW Q
+
+..loop:
 
 ADDI T1, T1, 1
 INCLUDE "./two/prog2.txt"
 
 SET symbol, 8+1+1+1
-SET symbol_two, symbol+11, .loop - START
+SET symbol_two, symbol+11
 
 MACRO myMacro
 ADD T0, T1, #1
 ADDI T0, T1, #2
-ADDI T0, T1, #3
-ENDM
+ADDI T0, T1, #4
+;ENDM
 
-INVOKE myMacro, T5, symbol_two, 8+5
+INVOKE myMacro, T5, symbol_two, 8+5, 7
 
 END: SW T5, [T6 + 7+8*(765 & 0xFF)]
 AFTER_END:
