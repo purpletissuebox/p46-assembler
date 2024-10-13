@@ -19,11 +19,13 @@ ENDC
 
 REPEAT Q
 DATAW Q
+ENDR
 
 ..loop:
 
 ADDI T1, T1, 1
 INCLUDE "./two/prog2.txt"
+INCLUDE "<prog3.txt>"
 
 SET symbol, 8+1+1+1
 SET symbol_two, symbol+11
@@ -31,10 +33,11 @@ SET symbol_two, symbol+11
 MACRO myMacro
 ADD T0, T1, #1
 ADDI T0, T1, #2
-ADDI T0, T1, #4
-;ENDM
+ADDI T0, T1, #3
+.pingas:
+ENDM
 
-INVOKE myMacro, T5, symbol_two, 8+5, 7
+INVOKE myMacro, T5, symbol_two, 8+5
 
 END: SW T5, [T6 + 7+8*(765 & 0xFF)]
 AFTER_END:
